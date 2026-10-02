@@ -126,3 +126,94 @@ def application(env, start_response):
         headers += [('Access-Control-Allow-Origin', origin), ('Vary', 'Origin')]
     def reply(code, value):
         encoded = b'' if code == 204 else json.dumps(value).encode()
+        status = {
+            200: 'OK', 204: 'No Content', 400: 'Bad Request',
+            403: 'Forbidden', 404: 'Not Found',
+            413: 'Content Too Large', 429: 'Too Many Requests',
+            503: 'Service Unavailable'
+        }
+        start_response(
+            f'{code} {status.get(code, "Error")}',
+            headers + [
+                ('Content-Type', 'application/json'),
+                ('Content-Length', str(len(encoded)))
+            ]
+        )
+        return [encoded]
+
+    if method == 'GET' and path == '/health':
+        return reply(200, {'ready': bool(ready())})
+
+    if method == 'OPTIONS':
+        if origin not in ORIGINS:
+            return reply(403, {'error': 'Request not allowed.'})
+        headers += [
+            ('Access-Control-Allow-Methods', 'POST, OPTIONS'),
+            ('Access-Control-Allow-Headers', 'Content-Type')
+        ]
+        return reply(204, {})
+
+    if method == 'GET' and re.fullmatch(
+        r'/concepts/[a-f0-9]{32}-[a-f0-9]{48}\.png', path
+    ):
+        file = DATA / 'concepts' / path.rsplit('/', 1)[1]
+        if not file.is_file():
+            return reply(404, {'error': 'Preview not found.'})
+        image = file.read_bytes()
+        start_response('200 OK', [
+            ('Content-Type', 'image/png'),
+            ('Content-Length', str(len(image))),
+            ('Cache-Control', 'private, max-age=3600'),
+            ('X-Content-Type-Options', 'nosniff'),
+            ('X-Robots-Tag', 'noindex')
+        ])
+        return [image]
+
+    if method != 'POST' or path != '/generate':
+        return reply(404, {'error': 'Not found.'})
+    if origin not in ORIGINS:
+        return reply(403, {'error': 'Request not allowed.'})
+    if not ready():
+        return reply(503, {'error': 'AI previews are not available yet.'})
+
+    try:
+        size = int(env.get('CONTENT_LENGTH') or 0)
+        if size <= 0 or size > 4_000_000:
+            return reply(413, {'error': 'The request is too large.'})
+        if not env.get('CONTENT_TYPE', '').startswith('application/json'):
+            return reply(400, {'error': 'Send a JSON request.'})
+        payload = json.loads(env['wsgi.input'].read(size))
+        if not isinstance(payload, dict):
+            return reply(400, {'error': 'Invalid request.'})
+
+        prompt = validate_input(payload)
+        logo = logo_bytes(payload.get('logo'))
+        ip = env.get('REMOTE_ADDR', 'unknown')
+        proof = call(
+            'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+            json.dumps({
+                'secret': os.environ['TURNSTILE_SECRET_KEY'],
+                'response': payload['token']
+            }).encode(),
+            timeout=15
+        )
+        allowed_hosts = {parse.urlparse(url).hostname for url in ORIGINS}
+        if (
+            not proof.get('success')
+            or proof.get('hostname') not in allowed_hosts
+            or proof.get('action') != 'design_preview'
+        ):
+            return reply(403, {
+                'error': 'Verification failed. Please verify again.'
+            })
+        try:
+            reserve(ip)
+        except ValueError as exc:
+            return reply(429, {'error': str(exc)})
+        return reply(200, generate(payload, prompt, logo))
+    except ValueError:
+        return reply(400, {'error': 'Check your brief, options and logo.'})
+    except Exception:
+        return reply(503, {
+            'error': 'The preview service is temporarily unavailable.'
+        })
