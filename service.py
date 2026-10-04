@@ -13,11 +13,14 @@ import sqlite3
 import time
 from urllib import request, error, parse
 from PIL import Image
+from defusedxml import ElementTree
+from cairosvg.surface import PNGSurface
+import pypdfium2 as pdfium
 
 Image.MAX_IMAGE_PIXELS = 12_000_000
 SIZES = {'3.5"x2"', '3.5"x1.5"', '3.25"x1.75"', '3.375"x2.25"'}
 SIDES = {'One Side', 'Both Sides'}
-DATA = Path(os.environ.get('DATA_DIR', './data'))
+DATA = Path(os.environ.get('DATA_DIR', '/var/data' if Path('/var/data').is_dir() else './data'))
 ORIGINS = set(os.environ.get('ALLOWED_ORIGINS', 'https://nepsprint.com,https://www.nepsprint.com').split(','))
 PUBLIC = os.environ.get('PUBLIC_BASE_URL', '').rstrip('/')
 MODEL = os.environ.get('OPENAI_IMAGE_MODEL', 'gpt-image-2.5-sunburst')
@@ -42,28 +45,79 @@ def validate_input(payload):
         raise ValueError('Complete the preview verification and try again.')
     return prompt.strip()
 
-def logo_bytes(value):
+def logo_upload(value):
     if value is None:
-        return None
-    if not isinstance(value, str) or len(value) > 2_800_000:
-        raise ValueError('Choose a PNG or JPG logo up to 2 MB.')
-    match = re.fullmatch(r'data:image/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)', value)
+        return None, None, None
+    if not isinstance(value, str) or len(value) > 7_000_000:
+        raise ValueError('Choose a PNG, JPG, PDF or SVG logo up to 5 MB.')
+    match = re.fullmatch(r'data:(image/png|image/jpeg|application/pdf|image/svg\+xml);base64,([A-Za-z0-9+/=]+)', value)
     if not match:
-        raise ValueError('Choose a PNG or JPG logo.')
+        raise ValueError('Choose a PNG, JPG, PDF or SVG logo.')
     try:
-        raw = base64.b64decode(match[1], validate=True)
-        if len(raw) > 2 * 1024 * 1024:
+        mime = match[1]
+        raw = base64.b64decode(match[2], validate=True)
+        if not raw or len(raw) > 5 * 1024 * 1024:
             raise ValueError()
-        with Image.open(io.BytesIO(raw)) as image:
+        if mime == 'application/pdf':
+            if not raw.startswith(b'%PDF-'):
+                raise ValueError()
+            with pdfium.PdfDocument(raw) as document:
+                if not len(document):
+                    raise ValueError()
+                page = document[0]
+                try:
+                    width, height = page.get_size()
+                    if width <= 0 or height <= 0 or max(width, height) / min(width, height) > 100:
+                        raise ValueError()
+                    bitmap = page.render(scale=min(1600 / width, 1600 / height))
+                    try:
+                        image = bitmap.to_pil().copy()
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+            extension = 'pdf'
+        elif mime == 'image/svg+xml':
+            root = ElementTree.fromstring(raw)
+            if root.tag.split('}')[-1] != 'svg':
+                raise ValueError()
+            # No active content, external resources, embedded images, or CSS imports.
+            nodes = list(root.iter())
+            if len(nodes) > 10000:
+                raise ValueError()
+            for node in nodes:
+                if node.tag.split('}')[-1] in ('script', 'foreignObject', 'image', 'use', 'feImage'):
+                    raise ValueError()
+                values = list(node.attrib.values()) + [node.text or '']
+                if any(re.search(r'@import', text, re.I) or
+                       any(not target.strip(' \"\'').startswith('#')
+                           for target in re.findall(r'url\s*\((.*?)\)', text, re.I))
+                       for text in values):
+                    raise ValueError()
+                if any(key.split('}')[-1].lower().startswith('on') or
+                       key.split('}')[-1] in ('href', 'src') for key in node.attrib):
+                    raise ValueError()
+            def no_external_resources(url, resource_type):
+                raise ValueError('External SVG resources are not supported.')
+            rendered = PNGSurface.convert(bytestring=raw, output_width=1600, output_height=1600,
+                                          url_fetcher=no_external_resources)
+            image = Image.open(io.BytesIO(rendered))
+            extension = 'svg'
+        else:
+            image = Image.open(io.BytesIO(raw))
             if image.format not in ('PNG', 'JPEG') or image.width * image.height > 12_000_000:
                 raise ValueError()
+            if (mime == 'image/png') != (image.format == 'PNG'):
+                raise ValueError()
+            extension = 'png' if mime == 'image/png' else 'jpg'
+        with image:
             image.load()
             image.thumbnail((1600, 1600))
             output = io.BytesIO()
             image.convert('RGBA').save(output, format='PNG')
-            return output.getvalue()
+            return output.getvalue(), raw, extension
     except Exception:
-        raise ValueError('The logo could not be read. Choose a valid PNG or JPG.') from None
+        raise ValueError('The logo could not be read. Use a valid PNG, JPG, unencrypted PDF or self-contained SVG up to 5 MB.') from None
 
 def reserve(ip):
     DATA.mkdir(parents=True, exist_ok=True)
@@ -82,7 +136,7 @@ def reserve(ip):
         # Failed API attempts remain counted, so retries cannot bypass spending limits.
         db.execute('INSERT INTO attempts VALUES (?, ?)', (now, digest))
 
-def generate(payload, prompt, logo):
+def generate(payload, prompt, logo, original=None, extension=None):
     instruction = ('Create one professional business card concept for a NEPS customer. '
         'Show a flat front-and-back design presentation on a neutral background, each card in the requested finished proportions. '
         'Premium soft-touch matte surface, restrained raised clear gloss highlights on selected design elements. '
@@ -115,9 +169,16 @@ def generate(payload, prompt, logo):
     (DATA / 'concepts').mkdir(parents=True, exist_ok=True)
     name = concept_id + '-' + token
     (DATA / 'concepts' / (name + '.png')).write_bytes(output.getvalue())
+    original_url = None
+    if original:
+        (DATA / 'originals').mkdir(parents=True, exist_ok=True)
+        (DATA / 'originals' / (name + '.' + extension)).write_bytes(original)
+        original_url = PUBLIC + '/originals/' + name + '.' + extension
     (DATA / 'concepts' / (name + '.json')).write_text(json.dumps({'id': concept_id, 'brief': prompt,
-        'size': payload['size'], 'sides': payload['sides'], 'created_at': dt.datetime.now(dt.timezone.utc).isoformat()}))
-    return {'concept_id': concept_id, 'image_url': PUBLIC + '/concepts/' + name + '.png'}
+        'size': payload['size'], 'sides': payload['sides'], 'original_logo_url': original_url,
+        'created_at': dt.datetime.now(dt.timezone.utc).isoformat()}))
+    return {'concept_id': concept_id, 'image_url': PUBLIC + '/concepts/' + name + '.png',
+            'original_logo_url': original_url}
 
 def application(env, start_response):
     method, path, origin = env.get('REQUEST_METHOD'), env.get('PATH_INFO', ''), env.get('HTTP_ORIGIN', '')
@@ -142,7 +203,9 @@ def application(env, start_response):
         return [encoded]
 
     if method == 'GET' and path == '/health':
-        return reply(200, {'ready': bool(ready())})
+        return reply(200, {'ready': bool(ready()), 'logo_formats': ['png', 'jpg', 'pdf', 'svg'],
+                           'original_logo_retained': True, 'max_logo_bytes': 5 * 1024 * 1024,
+                           'supported_products': ['gloss-emboss-business-cards']})
 
     if method == 'OPTIONS':
         if origin not in ORIGINS:
@@ -169,6 +232,23 @@ def application(env, start_response):
         ])
         return [image]
 
+    if method == 'GET' and re.fullmatch(
+        r'/originals/[a-f0-9]{32}-[a-f0-9]{48}\.(pdf|svg|png|jpg)', path
+    ):
+        file = DATA / 'originals' / path.rsplit('/', 1)[1]
+        if not file.is_file():
+            return reply(404, {'error': 'Original file not found.'})
+        raw = file.read_bytes()
+        start_response('200 OK', [
+            ('Content-Type', 'application/octet-stream'),
+            ('Content-Disposition', 'attachment; filename="original-logo.' + file.suffix[1:] + '"'),
+            ('Content-Length', str(len(raw))),
+            ('Cache-Control', 'private, no-store'),
+            ('X-Content-Type-Options', 'nosniff'),
+            ('X-Robots-Tag', 'noindex')
+        ])
+        return [raw]
+
     if method != 'POST' or path != '/generate':
         return reply(404, {'error': 'Not found.'})
     if origin not in ORIGINS:
@@ -178,7 +258,7 @@ def application(env, start_response):
 
     try:
         size = int(env.get('CONTENT_LENGTH') or 0)
-        if size <= 0 or size > 4_000_000:
+        if size <= 0 or size > 7_100_000:
             return reply(413, {'error': 'The request is too large.'})
         if not env.get('CONTENT_TYPE', '').startswith('application/json'):
             return reply(400, {'error': 'Send a JSON request.'})
@@ -187,7 +267,6 @@ def application(env, start_response):
             return reply(400, {'error': 'Invalid request.'})
 
         prompt = validate_input(payload)
-        logo = logo_bytes(payload.get('logo'))
         ip = env.get('REMOTE_ADDR', 'unknown')
         proof = call(
             'https://challenges.cloudflare.com/turnstile/v0/siteverify',
@@ -210,9 +289,10 @@ def application(env, start_response):
             reserve(ip)
         except ValueError as exc:
             return reply(429, {'error': str(exc)})
-        return reply(200, generate(payload, prompt, logo))
-    except ValueError:
-        return reply(400, {'error': 'Check your brief, options and logo.'})
+        logo, original, extension = logo_upload(payload.get('logo'))
+        return reply(200, generate(payload, prompt, logo, original, extension))
+    except ValueError as exc:
+        return reply(400, {'error': str(exc) or 'Check your brief, options and logo.'})
     except Exception:
         return reply(503, {
             'error': 'The preview service is temporarily unavailable.'
