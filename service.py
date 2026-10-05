@@ -201,6 +201,21 @@ def validate_gloss_regions(regions, payload):
         valid.append({'category': region['category'], 'side': region['side'], 'points': points})
     return valid
 
+def log_gloss_failure(exc, product):
+    # Log classification only: never customer artwork, prompts, credentials or provider messages.
+    details = {'event': 'gloss_guide_failed', 'product': product, 'exception': type(exc).__name__}
+    if isinstance(exc, error.HTTPError):
+        details['http_status'] = exc.code
+        try:
+            provider_error = json.loads(exc.read(16384)).get('error', {})
+            for field in ('code', 'type', 'param'):
+                value = provider_error.get(field)
+                if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:/-]{1,120}', value):
+                    details['provider_' + field] = value
+        except Exception:
+            pass
+    print(json.dumps(details), flush=True)
+
 def suggest_gloss_regions(image_bytes, payload):
     point = {'type': 'object', 'properties': {'x': {'type': 'number'}, 'y': {'type': 'number'}}, 'required': ['x', 'y'], 'additionalProperties': False}
     region = {'type': 'object', 'properties': {'category': {'type': 'string', 'enum': sorted(GLOSS_CATEGORIES)}, 'side': {'type': 'string', 'enum': ['front', 'back']}, 'points': {'type': 'array', 'items': point}}, 'required': ['category', 'side', 'points'], 'additionalProperties': False}
@@ -257,8 +272,8 @@ def generate(payload, prompt, logo, original=None, extension=None):
     if product_handle(payload) in GLOSS_PRODUCTS:
         try:
             gloss_regions = suggest_gloss_regions(output.getvalue(), payload)
-        except Exception:
-            print('Suggested gloss regions unavailable; base concept retained.', flush=True)
+        except Exception as exc:
+            log_gloss_failure(exc, product_handle(payload))
     original_url = None
     if original:
         (DATA / 'originals').mkdir(parents=True, exist_ok=True)
