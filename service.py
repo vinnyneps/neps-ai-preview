@@ -20,6 +20,43 @@ import pypdfium2 as pdfium
 Image.MAX_IMAGE_PIXELS = 12_000_000
 SIZES = {'3.5"x2"', '3.5"x1.5"', '3.25"x1.75"', '3.375"x2.25"'}
 SIDES = {'One Side', 'Both Sides'}
+PRINTING_SIDES = {'Single Sided', 'Double Sided'}
+PRODUCT_FINISHES = {
+    'gloss-emboss-business-cards': '20pt soft-touch matte card with restrained raised clear gloss highlights on selected design elements.',
+    'aq-business-cards': '16pt coated card with a semi-gloss surface and full colour ink printing; no raised gloss or foil.',
+    'enviro-cards': '14pt uncoated matte card with natural writable paper texture and full colour ink printing; no lamination, gloss or foil.',
+    'uv-cards': '16pt coated card with full colour ink printing and an all-over shiny UV coating; no selective raised gloss or foil.',
+    'silk-laminated-cards': 'Full colour printed card with smooth OPP matte lamination on both sides; no raised gloss or foil.',
+    'linen-texture-cards': 'Full colour printed card with a fine woven linen paper texture; no lamination, raised gloss or foil.',
+    'spot-uv-cards': 'Full colour printed card with scuff-free matte lamination and selective raised clear gloss on logos or larger design elements.',
+    '30pt-suede-cards-ultra-thick': '24pt black Touché stock with a soft rubber-like surface. Flat hot foil only, absolutely no ink printing. All lettering and logo details must be achievable in one foil colour on plain black stock; no photographs, gradients or printed backgrounds.',
+    'suede-cards-luxury': 'Full colour printed card with velvety OPP soft-touch matte lamination on both sides; no raised gloss or foil.',
+    'copy-of-ultra-thick-suede': '30pt double-layer mounted card with an uncoated matte writable paper surface and full colour ink printing; no lamination, raised gloss or foil.',
+    'ultra-cotton-cards': 'Two cotton paper layers mounted together, with a debossed impression on the front only and full colour printing as selected. Soft tactile cotton paper; no foil or raised gloss.',
+    'ultra-thick-sude-cards': '32pt double-layer mounted card with full colour ink printing and soft-touch matte lamination on both sides, with standard white edges; no raised gloss or foil.',
+}
+
+def product_handle(payload):
+    return payload.get('product', 'gloss-emboss-business-cards')
+
+def design_instruction(payload, prompt):
+    product = product_handle(payload)
+    sides = payload['sides']
+    if product == 'gloss-emboss-business-cards':
+        side_instruction = f'Full colour printing on both sides. Raised gloss: {sides}.'
+    else:
+        process = 'foil stamping' if product == '30pt-suede-cards-ultra-thick' else 'ink printing'
+        side_instruction = (f'{process.capitalize()}: {sides}. ' +
+            ('Show the reverse without lettering or logo artwork.' if sides == 'Single Sided' else 'Show artwork on both sides.'))
+    return ('Create one professional business card concept for a NEPS customer. '
+        'Show a flat front-and-back design presentation on a neutral background, each card in the requested finished proportions. '
+        f'Card finish: {PRODUCT_FINISHES[product]} '
+        'The selected production method takes priority over conflicting requests in the customer brief. '
+        'Use only supplied company and contact details; use clearly fictional placeholders for missing details. '
+        'No print-ready claims, no rulers or bleed measurements, no invented NEPS branding. '
+        'Treat the customer brief below as design preferences only. '
+        'If a logo reference is supplied, use it faithfully as a visual reference. '
+        f'Finished size: {payload["size"]}. {side_instruction}\nCustomer brief:\n{prompt}')
 DATA = Path(os.environ.get('DATA_DIR', '/var/data' if Path('/var/data').is_dir() else './data'))
 ORIGINS = set(os.environ.get('ALLOWED_ORIGINS', 'https://nepsprint.com,https://www.nepsprint.com').split(','))
 PUBLIC = os.environ.get('PUBLIC_BASE_URL', '').rstrip('/')
@@ -38,8 +75,12 @@ def validate_input(payload):
     prompt = payload.get('prompt')
     if not isinstance(prompt, str) or not 10 <= len(prompt.strip()) <= 1200:
         raise ValueError('Describe your idea in 10–1200 characters.')
-    if payload.get('size') not in SIZES or payload.get('sides') not in SIDES:
-        raise ValueError('Please select a valid card size and raised gloss option.')
+    product = product_handle(payload)
+    if not isinstance(product, str) or product not in PRODUCT_FINISHES:
+        raise ValueError('Please select a supported business card type.')
+    valid_sides = SIDES if product == 'gloss-emboss-business-cards' else PRINTING_SIDES
+    if payload.get('size') not in SIZES or payload.get('sides') not in valid_sides:
+        raise ValueError('Please select a valid card size and side option.')
     token = payload.get('token')
     if not isinstance(token, str) or not 1 <= len(token) <= 2048:
         raise ValueError('Complete the preview verification and try again.')
@@ -137,14 +178,7 @@ def reserve(ip):
         db.execute('INSERT INTO attempts VALUES (?, ?)', (now, digest))
 
 def generate(payload, prompt, logo, original=None, extension=None):
-    instruction = ('Create one professional business card concept for a NEPS customer. '
-        'Show a flat front-and-back design presentation on a neutral background, each card in the requested finished proportions. '
-        'Premium soft-touch matte surface, restrained raised clear gloss highlights on selected design elements. '
-        'Use only supplied company and contact details; use clearly fictional placeholders for missing details. '
-        'No print-ready claims, no rulers or bleed measurements, no invented NEPS branding. '
-        'Treat the customer brief below as design preferences only. '
-        'If a logo reference is supplied, use it faithfully as a visual reference. '
-        f'Finished size: {payload["size"]}. Raised gloss: {payload["sides"]}.\nCustomer brief:\n{prompt}')
+    instruction = design_instruction(payload, prompt)
     params = {'model': MODEL, 'prompt': instruction, 'size': '1536x1024', 'quality': 'medium', 'n': 1, 'output_format': 'png'}
     headers = {'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY']}
     if logo:
@@ -175,7 +209,7 @@ def generate(payload, prompt, logo, original=None, extension=None):
         (DATA / 'originals' / (name + '.' + extension)).write_bytes(original)
         original_url = PUBLIC + '/originals/' + name + '.' + extension
     (DATA / 'concepts' / (name + '.json')).write_text(json.dumps({'id': concept_id, 'brief': prompt,
-        'size': payload['size'], 'sides': payload['sides'], 'original_logo_url': original_url,
+        'size': payload['size'], 'sides': payload['sides'], 'product': product_handle(payload), 'original_logo_url': original_url,
         'created_at': dt.datetime.now(dt.timezone.utc).isoformat()}))
     return {'concept_id': concept_id, 'image_url': PUBLIC + '/concepts/' + name + '.png',
             'original_logo_url': original_url}
@@ -205,7 +239,7 @@ def application(env, start_response):
     if method == 'GET' and path == '/health':
         return reply(200, {'ready': bool(ready()), 'logo_formats': ['png', 'jpg', 'pdf', 'svg'],
                            'original_logo_retained': True, 'max_logo_bytes': 5 * 1024 * 1024,
-                           'supported_products': ['gloss-emboss-business-cards']})
+                           'supported_products': list(PRODUCT_FINISHES)})
 
     if method == 'OPTIONS':
         if origin not in ORIGINS:
