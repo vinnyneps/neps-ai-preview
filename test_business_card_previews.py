@@ -39,7 +39,7 @@ class BusinessCardPreviews(unittest.TestCase):
     def test_all_products_generate_and_save_correct_finish(self):
         output = io.BytesIO()
         Image.new('RGB', (20, 10), 'white').save(output, 'PNG')
-        with tempfile.TemporaryDirectory() as directory, patch.object(service, 'DATA', Path(directory)), patch.object(service, 'PUBLIC', 'https://preview.example'), patch.dict(service.os.environ, {'OPENAI_API_KEY': 'test-only'}), patch.object(service, 'call', return_value={'data': [{'b64_json': base64.b64encode(output.getvalue()).decode()}]}) as provider:
+        with tempfile.TemporaryDirectory() as directory, patch.object(service, 'DATA', Path(directory)), patch.object(service, 'PUBLIC', 'https://preview.example'), patch.dict(service.os.environ, {'OPENAI_API_KEY': 'test-only'}), patch.object(service, 'suggest_gloss_regions', return_value=[]), patch.object(service, 'call', return_value={'data': [{'b64_json': base64.b64encode(output.getvalue()).decode()}]}) as provider:
             for product, finish in service.PRODUCT_FINISHES.items():
                 side = 'One Side' if product == 'gloss-emboss-business-cards' else 'Single Sided'
                 payload = dict(product=product, size='3.5"x2"', sides=side)
