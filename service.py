@@ -269,11 +269,7 @@ def generate(payload, prompt, logo, original=None, extension=None):
     name = concept_id + '-' + token
     (DATA / 'concepts' / (name + '.png')).write_bytes(output.getvalue())
     gloss_regions = []
-    if product_handle(payload) in GLOSS_PRODUCTS:
-        try:
-            gloss_regions = suggest_gloss_regions(output.getvalue(), payload)
-        except Exception as exc:
-            log_gloss_failure(exc, product_handle(payload))
+    # Finish preferences are reviewed by NEPS; automatic highlight analysis is disabled.
     original_url = None
     if original:
         (DATA / 'originals').mkdir(parents=True, exist_ok=True)
